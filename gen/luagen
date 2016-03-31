@@ -1,0 +1,360 @@
+#! /usr/bin/env python
+# -*- coding:utf-8 -*-
+
+"""
+luapp generator
+
+Usage:
+    luagen [--module=<module>] [--use-scope] [--out-path=<path>] <filename> ...
+    luagen (-h | --help)
+    luagen (-v | --version)
+
+Options:
+    -h --help               Show help screen.
+    -v --version            Show compiler version.
+
+    --module=<module>       module name
+    --out-path=<path>       output directory [default: luagen]
+"""
+
+import os
+import re
+import docopt
+
+from clang import cindex
+
+
+def ParseParams(displayname):
+    """
+    """
+    return re.search(r'\((.*)\)', displayname).group(1)
+
+def IndentLine(line, indent):
+    """
+    """
+    return '    ' * indent + line if line else line
+
+def IndentLines(lines, indent):
+    """
+    """
+    tmp = []
+    for l in lines:
+        tmp.append(IndentLine(l, indent))
+    return tmp
+
+def GetScopeList(cursor):
+    """
+    """
+    namespaces = []
+    while cursor.semantic_parent:
+        parent = cursor.semantic_parent
+        if parent and parent.kind in (cindex.CursorKind.NAMESPACE, cindex.CursorKind.CLASS_DECL,
+            cindex.CursorKind.STRUCT_DECL, cindex.CursorKind.ENUM_DECL):
+            namespaces.append(parent.spelling)
+            cursor = parent
+        else:
+            break
+
+    namespaces.reverse()
+    return namespaces
+
+def GetFullCursorName(cursor):
+    """
+    """
+    namespaces = GetScopeList(cursor)
+    namespaces.append(cursor.spelling)
+    return '::'.join(namespaces)
+
+def GetFunctionDecl(cursor):
+    """
+    """
+    filter_list = ['virtual', 'override']
+
+    token_list = []
+    for token in cursor.get_tokens():
+        token = token.spelling
+
+        if token in (';', '{'):
+            break;
+
+        if token not in filter_list:
+            token_list.append(token)
+
+    result_type = ''.join(token_list[:token_list.index('(') - 1])
+    qualifier = token_list[token_list.index(')') + 1:]
+    qualifier.insert(0, '')
+    qualifier = ' '.join(qualifier)
+
+    namespaces = GetScopeList(cursor)
+    namespaces.append('*')
+    func_scope = '::'.join(namespaces)
+
+    namespaces.pop()
+    namespaces.append(cursor.spelling)
+    fullname = '::'.join(namespaces)
+
+    decl = '(%s (%s)(%s)%s) &%s' % (
+        result_type,
+        func_scope,
+        ParseParams(cursor.displayname),
+        qualifier,
+        fullname
+    )
+
+    return decl
+
+class FunctionGenerator:
+    """
+    """
+    def __init__(self, cur, indent):
+        """
+        """
+        self.cur = cur
+        self.indent = indent
+
+    def GenerateCode(self):
+        """
+        """
+        code = 'def("%s", %s)' % (self.cur.spelling, GetFunctionDecl(self.cur))
+        return IndentLine(code, self.indent)
+
+class EnumGenerator:
+    """
+    """
+    def __init__(self, cur, indent):
+        """
+        """
+        self.cur = cur
+        self.indent = indent
+
+    def GenerateCode(self):
+        """
+        """
+        lines = []
+        lines.append('enum_("%s")' % (self.cur.spelling))
+
+        for cur in self.cur.get_children():
+            lines.append('    .def("%s", %d)' % (cur.spelling, cur.enum_value))
+
+        lines = IndentLines(lines, self.indent)
+        return '\n'.join(lines)
+
+class ClassGenerator:
+    """
+    """
+    def __init__(self, cur, indent):
+        """
+        """
+        self.cur = cur
+        self.indent = indent
+        self.base_list = []
+        self.constructor_list = []
+        self.member_function_list = []
+        self.data_member_list = []
+        self.static_function_list = []
+        self.static_member_list = []
+
+    def __ParseCursor(self):
+        """
+        """
+        for cur in self.cur.get_children():
+            if cur.access_specifier != cindex.AccessSpecifier.PUBLIC:
+                continue
+
+            if cur.kind == cindex.CursorKind.CXX_BASE_SPECIFIER:
+                self.base_list.append(cur)
+            elif cur.kind == cindex.CursorKind.CONSTRUCTOR:
+                self.constructor_list.append(cur)
+            elif cur.kind == cindex.CursorKind.CXX_METHOD:
+                if cur.is_static_method():
+                    self.static_function_list.append(cur)
+                else:
+                    self.member_function_list.append(cur)
+            elif cur.kind == cindex.CursorKind.FIELD_DECL:
+                self.data_member_list.append(cur)
+            elif cur.kind == cindex.CursorKind.VAR_DECL:
+                self.static_member_list.append(cur)
+
+    def GenerateCode(self):
+        """
+        """
+        self.__ParseCursor()
+        lines = []
+
+        code = 'class_<%s' % GetFullCursorName(self.cur)
+        for cur in self.base_list:
+            code += ', %s' % cur.displayname.split(' ')[-1]
+
+        code += '>("%s")' % (self.cur.spelling)
+        lines.append(code)
+
+        if not self.constructor_list:
+            lines.append('    .construct<>()')
+
+        for cur in self.constructor_list:
+            lines.append('    .construct<%s>()' % ParseParams(cur.displayname))
+
+        for cur in self.member_function_list:
+            lines.append('    .def("%s", %s)' % (cur.spelling, GetFunctionDecl(cur)))
+
+        for cur in self.data_member_list:
+            if cur.type.is_const_qualified():
+                lines.append('    .def_read("%s", &%s)' % (cur.spelling, GetFullCursorName(cur)))
+            else:
+                lines.append('    .def_rdwr("%s", &%s)' % (cur.spelling, GetFullCursorName(cur)))
+
+        if self.static_function_list or self.static_member_list:
+            lines.append('    [')
+
+        inner_lines = []
+        for cur in self.static_function_list:
+            inner_lines.append('        def("%s", %s)' % (cur.spelling, GetFunctionDecl(cur)))
+
+        for cur in self.static_member_list:
+            inner_lines.append('        def_rdwr("%s", &%s)' % (cur.spelling, GetFullCursorName(cur)))
+
+        if inner_lines:
+            lines += ',\n'.join(inner_lines).split('\n')
+
+        if self.static_function_list:
+            lines.append('    ]')
+
+        lines = IndentLines(lines, self.indent)
+        return '\n'.join(lines)
+
+class ScopeGenerator:
+    """
+    """
+    def __init__(self, cur, indent, filename):
+        """
+        """
+        self.cur = cur
+        self.indent = indent
+        self.filename = filename
+
+    def GenerateCode(self):
+        """
+        """
+        lines = []
+
+        if self.cur.kind == cindex.CursorKind.TRANSLATION_UNIT:
+            indent = self.indent
+        else:
+            lines.append(IndentLine('scope_("%s")[' % self.cur.spelling, self.indent))
+            indent = self.indent + 1
+
+        snippets = []
+        for cur in self.cur.get_children():
+            if cur.location.file.name != self.filename:
+                continue
+
+            if cur.kind == cindex.CursorKind.VAR_DECL:
+                continue
+            elif cur.kind == cindex.CursorKind.FUNCTION_DECL:
+                generator = FunctionGenerator(cur, indent)
+            elif cur.kind == cindex.CursorKind.ENUM_DECL:
+                generator = EnumGenerator(cur, indent)
+            elif cur.kind in (cindex.CursorKind.CLASS_DECL, cindex.CursorKind.STRUCT_DECL):
+                generator = ClassGenerator(cur, indent)
+            elif cur.kind == cindex.CursorKind.NAMESPACE:
+                generator = ScopeGenerator(cur, indent, self.filename)
+            else:
+                continue
+
+            snippets.append(generator.GenerateCode())
+
+        if not snippets:
+            return ''
+
+        lines.append(',\n'.join(snippets))
+
+        if self.cur.kind != cindex.CursorKind.TRANSLATION_UNIT:
+            lines.append(IndentLine(']', self.indent))
+
+        return '\n'.join(lines)
+
+class TranslationUnitGenerator(ScopeGenerator):
+    """
+    """
+    def __init__(self, filename, indent = 2):
+        """
+        """
+        self.filename = filename
+        self.tu = cindex.Index.create().parse(filename, ['-x', 'c++', '-std=c++11'])
+        ScopeGenerator.__init__(self, self.tu.cursor, indent, self.filename)
+
+def GenerateCode(include_files, module, use_scope, codes):
+    """
+    """
+    lines = []
+
+    lines.append('/* ')
+    lines.append(' * This file was generated by the luagen compiler. DO NOT EDIT!')
+    lines.append(' * ')
+    lines.append(' * Copyright (c) 2012 ~ 2019 zaxbbun <zaxbbun@gmail.com>')
+    lines.append(' * ')
+    lines.append(' * Permission is hereby granted, free of charge, to any person obtaining a copy')
+    lines.append(' * of this software and associated documentation files (the "Software"), to deal')
+    lines.append(' * in the Software without restriction, including without limitation the rights')
+    lines.append(' * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell')
+    lines.append(' * copies of the Software, and to permit persons to whom the Software is')
+    lines.append(' * furnished to do so, subject to the following conditions:')
+    lines.append(' * ')
+    lines.append(' * The above copyright notice and this permission notice shall be included in')
+    lines.append(' * all copies or substantial portions of the Software.')
+    lines.append(' * ')
+    lines.append(' * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR')
+    lines.append(' * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,')
+    lines.append(' * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE')
+    lines.append(' * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER')
+    lines.append(' * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,')
+    lines.append(' * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN')
+    lines.append(' * THE SOFTWARE.')
+    lines.append(' */')
+    lines.append('')
+    lines.append('#include <luapp.hpp>')
+
+    for filename in include_files:
+        lines.append('#include "%s"' % filename)
+
+    lines.append('')
+    lines.append('extern "C" int luaopen_%s(lua_State *lua)' % module)
+    lines.append('{')
+    lines.append('    using namespace luapp;')
+    lines.append('')
+    lines.append('    luaL_checkversion(lua);')
+    lines.append('')
+    lines.append('    module(lua, "%s")[' % module if use_scope else '    module(lua)[')
+    lines.append(         ',\n'.join(codes))
+    lines.append('    ];')
+    lines.append('')
+    lines.append('    return 0;')
+    lines.append('}')
+    lines.append('')
+
+    return '\n'.join(lines)
+
+def main(opts):
+    """
+    """
+    # cindex.conf.set_library_path(os.path.split(__file__)[0])
+    codes = []
+
+    for filename in opts['<filename>']:
+        base, ext = os.path.splitext(filename)
+        if ext.lower() not in ('.h', '.hpp', '.hxx'):
+            raise Exception('cannot compile file %s' % filename)
+
+        print 'parse %s ...' % filename
+        codes.append(TranslationUnitGenerator(filename).GenerateCode())
+
+    if not os.path.exists(opts['--out-path']):
+        os.mkdir(opts['--out-path'])
+
+    with open(os.path.join(opts['--out-path'], '%s.cpp' % opts['--module']), 'w') as f:
+        f.write(GenerateCode(opts['<filename>'], opts['--module'], opts['--use-scope'], codes))
+
+if __name__ == '__main__':
+    """
+    """
+    main(docopt.docopt(__doc__, version='version 1.0.0'))

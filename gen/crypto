@@ -1,0 +1,99 @@
+#! /usr/bin/env python
+# coding:utf-8
+
+"""
+Usage:
+    crypto [options] [-e|-d] -k <key> [--] <filename> ...
+
+options:
+    -e             encrypt files
+    -d             decrypt files
+    -k --key=<key> AES key [16/24/32 bytes]
+    -h --help      show this help info
+    -v --version   version info
+"""
+
+import sys
+import struct
+import docopt
+import hashlib
+
+from Crypto import Random
+from Crypto.Cipher import AES
+
+kMagic = 0x8716a700
+kBlockSize = 16
+
+def EncryptFile(cipher, filename):
+    """
+    """
+    with open(filename, 'rb') as f:
+        data = f.read()
+
+    magic = struct.unpack('I', data[:4])[0]
+    if magic == kMagic:
+        print 'already encrypted!'
+        return
+
+    file_size = len(data)
+    hash_code = hashlib.sha256(data).digest()
+    data += hash_code
+    size = len(data)
+    fill_size = (size + kBlockSize - 1) / kBlockSize * kBlockSize - size
+    data += '\0' * fill_size
+
+    data = cipher.encrypt(data)
+    with open(filename, 'wb') as f:
+        f.write(struct.pack('I', kMagic) + struct.pack('I', file_size) + data)
+
+    print '[OK]'
+
+def DecryptFile(cipher, filename):
+    """
+    """
+    with open(filename, 'rb') as f:
+        data = f.read()
+
+    magic, size = struct.unpack('II', data[:8])
+    if magic != kMagic:
+        print 'not encrypted!'
+        return
+
+    data = cipher.decrypt(data[8:])
+    hash_code = data[size:size+32]
+    if hashlib.sha256(data[:size]).digest() != hash_code:
+        print 'invalid key!'
+        return
+
+    with open(filename, 'wb') as f:
+        f.write(data[:size])
+
+    print '[OK]'
+
+def ExpandKey(key):
+    """
+    """
+    if len(key) > 32:
+        return key[:32]
+
+    key_len = (len(key) + 7) / 8 * 8
+    key_len = key_len if key_len > 16 else 16
+    key += hashlib.sha256(key).hexdigest()[:key_len - len(key)]
+    return key
+
+if __name__ == '__main__':
+    """
+    """
+    opts = docopt.docopt(__doc__, sys.argv[1:], True, "version 1.0")
+
+    opts['--key'] = ExpandKey(opts['--key'])
+    cipher = AES.new(opts['--key'], AES.MODE_ECB)
+    print 'key = %s' % opts['--key']
+
+    for filename in opts['<filename>']:
+        if opts['-e']:
+            print '[encrypt] %-40s' % filename,
+            EncryptFile(cipher, filename)
+        elif opts['-d']:
+            print '[decrypt] %-40s' % filename,
+            DecryptFile(cipher, filename)
