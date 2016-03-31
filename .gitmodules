@@ -1,0 +1,3 @@
+[submodule "dep/StackTracePlus"]
+	path = dep/StackTracePlus
+	url = https://github.com/ignacio/StackTracePlus
